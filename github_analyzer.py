@@ -6,7 +6,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from github import Github
-from github.GithubException import GithubException
+from github.GithubException import GithubException, RateLimitExceededException
 from dotenv import load_dotenv
 from flask import Flask, render_template_string, request, jsonify, g, send_from_directory
 from flask_limiter import Limiter
@@ -240,6 +240,26 @@ HTML_TEMPLATE = '''
 </html>
 '''
 
+def extract_username_from_url(github_url):
+    """Extract username from GitHub URL."""
+    try:
+        parsed = urlparse(github_url)
+        if 'github.com' not in parsed.netloc:
+            raise ValueError("Not a valid GitHub URL")
+        
+        path_parts = parsed.path.strip('/').split('/')
+        if not path_parts:
+            raise ValueError("No username found in URL")
+        
+        username = path_parts[0]
+        if not re.match(r'^[a-zA-Z0-9_-]+$', username):
+            raise ValueError("Invalid GitHub username format")
+        
+        return username
+    except Exception as e:
+        logger.error(f"Error extracting username from URL: {str(e)}")
+        raise ValueError("Invalid GitHub URL format")
+
 def validate_github_url(url):
     """Validate and sanitize GitHub URL."""
     if not url:
@@ -283,32 +303,41 @@ def analyze_github_profile(github_url):
         activity_dates = []
         activity_counts = []
         
-        # Get contribution activity
-        events = user.get_events()
-        event_counts = Counter()
-        
-        for event in events:
-            if event.created_at > datetime.now() - timedelta(days=30):
-                event_counts[event.created_at.date()] += 1
-        
-        activity_dates = [str(date) for date in sorted(event_counts.keys())]
-        activity_counts = [event_counts[date] for date in sorted(event_counts.keys())]
+        try:
+            # Get contribution activity
+            events = user.get_events()
+            event_counts = Counter()
+            
+            for event in events:
+                if event.created_at > datetime.now() - timedelta(days=30):
+                    event_counts[event.created_at.date()] += 1
+            
+            activity_dates = [str(date) for date in sorted(event_counts.keys())]
+            activity_counts = [event_counts[date] for date in sorted(event_counts.keys())]
+        except Exception as e:
+            logger.warning(f"Could not fetch activity data for {username}: {str(e)}")
+            activity_dates = []
+            activity_counts = []
         
         for repo in repos:
-            total_stars += repo.stargazers_count
-            if repo.stargazers_count > max_stars:
-                max_stars = repo.stargazers_count
-                most_starred_repo = repo.name
-            
-            repo_langs = repo.get_languages()
-            for lang, bytes_count in repo_langs.items():
-                languages[lang] = languages.get(lang, 0) + bytes_count
-                repo_languages.append({
-                    'name': repo.name,
-                    'language': lang,
-                    'stars': repo.stargazers_count,
-                    'forks': repo.forks_count
-                })
+            try:
+                total_stars += repo.stargazers_count
+                if repo.stargazers_count > max_stars:
+                    max_stars = repo.stargazers_count
+                    most_starred_repo = repo.name
+                
+                repo_langs = repo.get_languages()
+                for lang, bytes_count in repo_langs.items():
+                    languages[lang] = languages.get(lang, 0) + bytes_count
+                    repo_languages.append({
+                        'name': repo.name,
+                        'language': lang,
+                        'stars': repo.stargazers_count,
+                        'forks': repo.forks_count
+                    })
+            except Exception as e:
+                logger.warning(f"Error processing repo {repo.name}: {str(e)}")
+                continue
         
         # Calculate average stars per repo
         avg_stars_per_repo = total_stars / basic_info['repo_count'] if basic_info['repo_count'] > 0 else 0
@@ -338,6 +367,9 @@ def analyze_github_profile(github_url):
         
         return analysis_results
         
+    except RateLimitExceededException:
+        logger.error("GitHub API rate limit exceeded")
+        raise ValueError("GitHub API rate limit exceeded. Please try again later.")
     except GithubException as e:
         logger.error(f"GitHub API error for {username}: {str(e)}")
         if e.status == 404:
